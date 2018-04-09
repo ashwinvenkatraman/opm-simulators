@@ -20,7 +20,7 @@
 #ifndef OPM_ISTLSOLVER_HEADER_INCLUDED
 #define OPM_ISTLSOLVER_HEADER_INCLUDED
 
-#include <opm/autodiff/AdditionalObjectDeleter.hpp>
+#include <opm/autodiff/BlackoilAmg.hpp>
 #include <opm/autodiff/CPRPreconditioner.hpp>
 #include <opm/autodiff/NewtonIterationBlackoilInterleaved.hpp>
 #include <opm/autodiff/NewtonIterationUtilities.hpp>
@@ -310,6 +310,27 @@ public:
 
 namespace Opm
 {
+namespace Detail
+{
+    //! calculates ret = A^T * B
+    template< class K, int m, int n, int p >
+    static inline void multMatrixTransposed ( const Dune::FieldMatrix< K, n, m > &A,
+                                              const Dune::FieldMatrix< K, n, p > &B,
+                                              Dune::FieldMatrix< K, m, p > &ret )
+    {
+        typedef typename Dune::FieldMatrix< K, m, p > :: size_type size_type;
+
+        for( size_type i = 0; i < m; ++i )
+        {
+            for( size_type j = 0; j < p; ++j )
+            {
+                ret[ i ][ j ] = K( 0 );
+                for( size_type k = 0; k < n; ++k )
+                    ret[ i ][ j ] += A[ k ][ i ] * B[ k ][ j ];
+            }
+        }
+    }
+}
     /// This class solves the fully implicit black-oil system by
     /// solving the reduced system (after eliminating well variables)
     /// as a block-structured matrix (one block for all cell variables) for a fixed
@@ -380,28 +401,35 @@ namespace Opm
         /// \brief construct the CPR preconditioner and the solver.
         /// \tparam P The type of the parallel information.
         /// \param parallelInformation the information about the parallelization.
+#if DUNE_VERSION_NEWER(DUNE_ISTL, 2, 6)
+        template<Dune::SolverCategory::Category category=Dune::SolverCategory::sequential,
+                 class LinearOperator, class POrComm>
+#else
         template<int category=Dune::SolverCategory::sequential, class LinearOperator, class POrComm>
+#endif
         void constructPreconditionerAndSolve(LinearOperator& linearOperator,
                                              Vector& x, Vector& istlb,
                                              const POrComm& parallelInformation_arg,
                                              Dune::InverseOperatorResult& result) const
         {
             // Construct scalar product.
+#if DUNE_VERSION_NEWER(DUNE_ISTL, 2, 6)
+            auto sp = Dune::createScalarProduct<Vector,POrComm>(parallelInformation_arg, category);
+#else
             typedef Dune::ScalarProductChooser<Vector, POrComm, category> ScalarProductChooser;
             typedef std::unique_ptr<typename ScalarProductChooser::ScalarProduct> SPPointer;
             SPPointer sp(ScalarProductChooser::construct(parallelInformation_arg));
+#endif
 
             // Communicate if parallel.
             parallelInformation_arg.copyOwnerToAll(istlb, istlb);
 
 #if FLOW_SUPPORT_AMG // activate AMG if either flow_ebos is used or UMFPack is not available
-            if( parameters_.linear_solver_use_amg_ )
+            if( parameters_.linear_solver_use_amg_ || parameters_.use_cpr_)
             {
                 typedef ISTLUtility::CPRSelector< Matrix, Vector, Vector, POrComm>  CPRSelectorType;
-                typedef typename CPRSelectorType::AMG AMG;
                 typedef typename CPRSelectorType::Operator MatrixOperator;
 
-                std::unique_ptr< AMG > amg;
                 std::unique_ptr< MatrixOperator > opA;
 
                 if( ! std::is_same< LinearOperator, MatrixOperator > :: value )
@@ -410,13 +438,35 @@ namespace Opm
                     opA.reset( CPRSelectorType::makeOperator( linearOperator.getmat(), parallelInformation_arg ) );
                 }
 
-                const double relax = 1.0;
+                const double relax = parameters_.ilu_relaxation_;
+                if (  parameters_.use_cpr_ )
+                {
+                    using Matrix         = typename MatrixOperator::matrix_type;
+                    using CouplingMetric = Dune::Amg::Diagonal<pressureIndex>;
+                    using CritBase       = Dune::Amg::SymmetricCriterion<Matrix, CouplingMetric>;
+                    using Criterion      = Dune::Amg::CoarsenCriterion<CritBase>;
+                    using AMG = typename ISTLUtility
+                        ::BlackoilAmgSelector< Matrix, Vector, Vector,POrComm, Criterion, pressureIndex >::AMG;
 
-                // Construct preconditioner.
-                constructAMGPrecond( linearOperator, parallelInformation_arg, amg, opA, relax );
+                    std::unique_ptr< AMG > amg;
+                    // Construct preconditioner.
+                    Criterion crit(15, 2000);
+                    constructAMGPrecond<Criterion>( linearOperator, parallelInformation_arg, amg, opA, relax );
 
-                // Solve.
-                solve(linearOperator, x, istlb, *sp, *amg, result);
+                    // Solve.
+                    solve(linearOperator, x, istlb, *sp, *amg, result);
+                }
+                else
+                {
+                    typedef typename CPRSelectorType::AMG AMG;
+                    std::unique_ptr< AMG > amg;
+
+                    // Construct preconditioner.
+                    constructAMGPrecond( linearOperator, parallelInformation_arg, amg, opA, relax );
+
+                    // Solve.
+                    solve(linearOperator, x, istlb, *sp, *amg, result);
+                }
             }
             else
 #endif
@@ -486,6 +536,20 @@ namespace Opm
             ISTLUtility::template createAMGPreconditionerPointer<pressureIndex>( opA, relax, comm, amg );
         }
 
+        template <class C, class LinearOperator, class MatrixOperator, class POrComm, class AMG >
+        void
+        constructAMGPrecond(LinearOperator& /* linearOperator */, const POrComm& comm, std::unique_ptr< AMG >& amg, std::unique_ptr< MatrixOperator >& opA, const double relax ) const
+        {
+            ISTLUtility::template createAMGPreconditionerPointer<C>( *opA, relax, comm, amg, parameters_ );
+        }
+
+
+        template <class C, class MatrixOperator, class POrComm, class AMG >
+        void
+        constructAMGPrecond(MatrixOperator& opA, const POrComm& comm, std::unique_ptr< AMG >& amg, std::unique_ptr< MatrixOperator >&, const double relax ) const
+        {
+            ISTLUtility::template createAMGPreconditionerPointer<C>( opA, relax, comm, amg, parameters_ );
+        }
         /// \brief Solve the system using the given preconditioner and scalar product.
         template <class Operator, class ScalarProd, class Precond>
         void solve(Operator& opA, Vector& x, Vector& istlb, ScalarProd& sp, Precond& precond, Dune::InverseOperatorResult& result) const
