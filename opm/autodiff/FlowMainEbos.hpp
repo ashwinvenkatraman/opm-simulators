@@ -303,6 +303,7 @@ namespace Opm
                 std::string debugFile = debugFileStream.str();
                 std::shared_ptr<StreamLog> debugLog = std::make_shared<EclipsePRTLog>(debugFile, Log::DefaultMessageTypes, false, output_cout_);
                 OpmLog::addBackend( "DEBUGLOG" ,  debugLog);
+                debugLog->setMessageFormatter(std::make_shared<SimpleMessageFormatter>(false));
             }
 
             std::shared_ptr<StreamLog> streamLog = std::make_shared<StreamLog>(std::cout, Log::StdoutMessageTypes);
